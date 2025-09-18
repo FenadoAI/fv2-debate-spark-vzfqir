@@ -255,7 +255,24 @@ async def generate_debate_arguments(request: DebateTopicRequest):
                 )
 
                 ai_response = response.text
-                parsed_response = json.loads(ai_response)
+
+                # Clean up markdown code blocks if present
+                clean_response = ai_response.strip()
+                if clean_response.startswith('```json'):
+                    clean_response = clean_response.replace('```json', '').replace('```', '').strip()
+                elif clean_response.startswith('```'):
+                    clean_response = clean_response.replace('```', '').strip()
+
+                # Try to extract JSON from the text if it's not perfect
+                if not clean_response.startswith('{'):
+                    # Find the first { and last } to extract JSON
+                    start_idx = clean_response.find('{')
+                    end_idx = clean_response.rfind('}')
+                    if start_idx != -1 and end_idx != -1:
+                        clean_response = clean_response[start_idx:end_idx+1]
+
+                parsed_response = json.loads(clean_response)
+                logger.info(f"Successfully parsed Gemini response with {len(parsed_response.get('arguments_for', []))} FOR and {len(parsed_response.get('arguments_against', []))} AGAINST arguments")
 
             except Exception as gemini_error:
                 logger.warning(f"Gemini API failed: {str(gemini_error)}, trying OpenAI...")

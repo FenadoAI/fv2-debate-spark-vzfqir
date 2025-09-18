@@ -12,6 +12,14 @@ import uuid
 from datetime import datetime
 from openai import OpenAI
 
+# Try to import Gemini, but make it optional
+try:
+    from google import genai
+    GEMINI_AVAILABLE = True
+except ImportError:
+    GEMINI_AVAILABLE = False
+    genai = None
+
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -23,6 +31,12 @@ db = mongo_client[os.environ['DB_NAME']]
 
 # OpenAI client
 openai_client = OpenAI(api_key=os.environ['OPENAI_API_KEY'])
+
+# Gemini client
+if GEMINI_AVAILABLE:
+    gemini_client = genai.Client(api_key=os.environ['GEMINI_API_KEY'])
+else:
+    gemini_client = None
 
 # Create the main app without a prefix
 app = FastAPI()
@@ -51,6 +65,15 @@ class DebateResponse(BaseModel):
     topic: str
     arguments_for: List[Argument]
     arguments_against: List[Argument]
+
+class GeminiRequest(BaseModel):
+    prompt: str
+    max_tokens: int = 1000
+    temperature: float = 0.7
+
+class GeminiResponse(BaseModel):
+    response: str
+    model: str
 
 # Add your routes to the router instead of directly to app
 @api_router.get("/")
@@ -189,54 +212,80 @@ def generate_mock_debate_arguments(topic: str) -> dict:
 @api_router.post("/generate-debate", response_model=DebateResponse)
 async def generate_debate_arguments(request: DebateTopicRequest):
     try:
-        # Check if we have a valid OpenAI API key
-        if os.environ.get('OPENAI_API_KEY', '').startswith('sk-placeholder'):
-            # Use mock data for demo
-            parsed_response = generate_mock_debate_arguments(request.topic)
-        else:
-            # Use real OpenAI API
-            prompt = f"""
-            Generate balanced debate arguments for the topic: "{request.topic}"
+        # Try Gemini first, fallback to OpenAI, then mock data
+        parsed_response = None
 
-            Please provide:
-            1. 3-4 strong arguments FOR the topic with supporting facts
-            2. 3-4 strong arguments AGAINST the topic with supporting facts
-
-            Format the response as JSON with this structure:
-            {{
-                "arguments_for": [
-                    {{
-                        "point": "Main argument point",
-                        "supporting_facts": ["Fact 1", "Fact 2", "Fact 3"]
-                    }}
-                ],
-                "arguments_against": [
-                    {{
-                        "point": "Main argument point",
-                        "supporting_facts": ["Fact 1", "Fact 2", "Fact 3"]
-                    }}
-                ]
-            }}
-
-            Ensure arguments are well-researched, factual, and present both sides fairly.
-            """
-
-            response = openai_client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": "You are a knowledgeable debate coach who provides balanced, well-researched arguments for any topic. Always respond with valid JSON only."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7,
-                max_tokens=2000
-            )
-
-            ai_response = response.choices[0].message.content
+        if GEMINI_AVAILABLE and gemini_client:
             try:
+                # Use Gemini API
+                prompt = f"""
+                Generate balanced debate arguments for the topic: "{request.topic}"
+
+                Please provide:
+                1. 3-4 strong arguments FOR the topic with supporting facts
+                2. 3-4 strong arguments AGAINST the topic with supporting facts
+
+                Format the response as JSON with this structure:
+                {{
+                    "arguments_for": [
+                        {{
+                            "point": "Main argument point",
+                            "supporting_facts": ["Fact 1", "Fact 2", "Fact 3"]
+                        }}
+                    ],
+                    "arguments_against": [
+                        {{
+                            "point": "Main argument point",
+                            "supporting_facts": ["Fact 1", "Fact 2", "Fact 3"]
+                        }}
+                    ]
+                }}
+
+                Ensure arguments are well-researched, factual, and present both sides fairly.
+                """
+
+                response = gemini_client.models.generate_content(
+                    model='gemini-2.0-flash-001',
+                    contents=prompt,
+                    config={
+                        'system_instruction': 'You are a knowledgeable debate coach who provides balanced, well-researched arguments for any topic. Always respond with valid JSON only.',
+                        'temperature': 0.7,
+                        'max_output_tokens': 2000
+                    }
+                )
+
+                ai_response = response.text
                 parsed_response = json.loads(ai_response)
-            except json.JSONDecodeError:
-                # Fallback to mock data
-                parsed_response = generate_mock_debate_arguments(request.topic)
+
+            except Exception as gemini_error:
+                logger.warning(f"Gemini API failed: {str(gemini_error)}, trying OpenAI...")
+                parsed_response = None
+        else:
+            # Gemini not available, skip to OpenAI
+            parsed_response = None
+
+        # Fallback to OpenAI if Gemini failed or not available
+        if parsed_response is None:
+            if not os.environ.get('OPENAI_API_KEY', '').startswith('sk-placeholder'):
+                try:
+                    response = openai_client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[
+                            {"role": "system", "content": "You are a knowledgeable debate coach who provides balanced, well-researched arguments for any topic. Always respond with valid JSON only."},
+                            {"role": "user", "content": prompt}
+                        ],
+                        temperature=0.7,
+                        max_tokens=2000
+                    )
+
+                    ai_response = response.choices[0].message.content
+                    parsed_response = json.loads(ai_response)
+                except Exception as openai_error:
+                    logger.warning(f"OpenAI API also failed: {str(openai_error)}, using mock data...")
+
+        # Final fallback to mock data
+        if parsed_response is None:
+            parsed_response = generate_mock_debate_arguments(request.topic)
 
         # Create the response
         debate_response = DebateResponse(
@@ -250,6 +299,34 @@ async def generate_debate_arguments(request: DebateTopicRequest):
     except Exception as e:
         logger.error(f"Error generating debate arguments: {str(e)}")
         raise HTTPException(status_code=500, detail="Failed to generate debate arguments")
+
+@api_router.post("/gemini-generate", response_model=GeminiResponse)
+async def generate_with_gemini(request: GeminiRequest):
+    """Generate text using Gemini AI"""
+    if not GEMINI_AVAILABLE or gemini_client is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini API is not available. Please install google-genai package and ensure GEMINI_API_KEY is set."
+        )
+
+    try:
+        response = gemini_client.models.generate_content(
+            model='gemini-2.0-flash-001',
+            contents=request.prompt,
+            config={
+                'temperature': request.temperature,
+                'max_output_tokens': request.max_tokens
+            }
+        )
+
+        return GeminiResponse(
+            response=response.text,
+            model='gemini-2.0-flash-001'
+        )
+
+    except Exception as e:
+        logger.error(f"Error generating content with Gemini: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate content with Gemini: {str(e)}")
 
 # Include the router in the main app
 app.include_router(api_router)
